@@ -15,6 +15,7 @@ import torch.nn.functional as F
 from prompt.utils import *
 from prompt.model.model import PromptDecoder, PromptConfig, AutoPromptDecoder
 from prompt.model.modeling_llama_custom import LlamaForCausalLM as CustomLlamaForCausalLM
+from prompt.model.kv_cache import initialize_past_key_values
 
 IGNORE_TOKEN_ID = LabelSmoother.ignore_index
 
@@ -58,6 +59,22 @@ class ParamEfficientFineTuner(Trainer):
 
 
 class DistillationTrainer(Trainer):
+    #copied from https://github.com/LiuXiaoxuanPKU/OSD/blob/main/distill/distill_trainer.py
+    def __init__(self, *args, ** kwargs):
+        super().__init__(*args, **kwargs)
+        args = kwargs["args"]
+
+        # test time training parameters
+        self.mode = args.mode
+        self.ttt_update_interval = args.ttt_update_interval
+        self.buffer = []
+        # self.alphas = []
+        # self.alphas_by_dataset = {}
+        # self.alphas_by_language = {}
+        # self.alphs_by_topic = {}
+        # self.sample_steps = []
+        self.training_step_1 = True
+
     def compute_loss(self, model, inputs, return_outputs=False):
         """
         Compute the training loss for the model.
@@ -99,6 +116,103 @@ class DistillationTrainer(Trainer):
             loss /= num_special_tokens
         return (loss, outputs) if return_outputs else loss
     
+    #adapted from https://github.com/LiuXiaoxuanPKU/OSD/blob/main/distill/distill_trainer.py
+    def traning_step(self, model, inputs):
+        self.train_step_cnt += 1
+        if self.mode == "offline":
+            return super().training_step(model, inputs)
+        elif self.mode == "online":
+            return self.ttt_training_step(model, inputs)
+        else:
+            raise ValueError()
+    
+    def ttt_training_step(self, model, inputs):
+        max_new_tokens = 128
+        batch_size = inputs["inputs_ids"].shape[0]
+        assert(
+            batch_size == 1
+        )
+        num_special_tokens = self.model.active_peft_config.num_special_tokens
+
+        #remove masking
+        input_ids = inputs["input_ids"][inputs["attention_mask"]].unsqueeze(0)
+        
+        #use ppd to generate tokens
+        if self.training_step_1:
+            (past_key_values,
+                past_key_values_data,
+                current_length_data,
+            ) = initialize_past_key_values(model.base_model)
+            outputs = model(
+            input_ids=input_ids,
+            )
+            logits = outputs.logits[:, -num_special_tokens-1:-num_special_tokens, :]
+            prompt_logits = outputs.logits[:, -num_special_tokens:, :]
+            self.training_step_1 = False
+        
+        temperature = 0.0
+        posterior_threshold = 0.09
+        posterior_alpha = 0.3
+        sampling = 'greedy'
+
+        with torch.inference_mode():
+            candidates, tree_candidates_embeds = model.generate_candidates(
+                logits, 
+                prompt_logits, 
+                temperature, 
+                posterior_threshold, 
+                posterior_alpha, 
+                sampling)
+            logits, all_logits = model.tree_decoding(tree_candidates_embeds, past_key_values, input_ids)
+            best_candidate, accept_length = model.evaluate_posterior(
+                logits, 
+                candidates, 
+                temperature, 
+                posterior_threshold, 
+                posterior_alpha,
+                sampling)
+            #get first rejected logits from best candidates
+            if accept_length != logits.size(-1):
+                test_logits = logits[None, best_candidate, accept_length+1 : accept_length + 2]
+                #get first regjected prompt logits
+                candidate_index = model.inference_buffers['retrieve_indices'][best_candidate, accept_length : accept_length + 1]
+                prompt_token_indices = model.inference_buffers['special_token_indices'][candidate_index.cpu().item()]
+                test_prompt_logits = all_logits[:, prompt_token_indices][:,0,:]
+                #update buffer with rejected candidates and logits
+                self.buffer.append([test_logits, test_prompt_logits])
+            input_ids, logits, prompt_logits, new_token = model.update_inference_inputs(
+                    input_ids,
+                    candidates,
+                    best_candidate,
+                    accept_length,
+                    logits,
+                    all_logits,
+                    new_token,
+                    past_key_values_data,
+                    current_length_data,
+            )
+            inputs["input_ids"] = input_ids
+
+        #update model
+        if len(self.buffer) >= self.ttt_update_interval:
+            self.model.train()
+
+            #compute loss
+            loss = 0
+            for logit, prompt_logit in self.buffer:
+                loss_i = F.kl_div(
+                    F.log_softmax(prompt_logit),
+                    F.softmax(logit),
+                    reduction='sum'
+                ) / prompt_logits.shape[0]
+                loss += loss_i
+            loss.backward()
+            self.buffer = []
+            return loss.detach()
+        else:
+            self.model.eval()
+            return torch.tensor(-1).cuda()
+
 
 @dataclass
 class ModelArguments:
@@ -150,6 +264,19 @@ class TrainingArguments(transformers.TrainingArguments):
             "help": "Maximum sequence length. Sequences will be right padded (and possibly truncated)."
         },
     )
+    mode: str = field(
+        default = "offline",
+        metadata={"help": "offline training mode or online training mode"},
+    )
+    online_training_model_path: str = field(
+        default="hmarkc/ppd-vicuna-7b-v1.3",
+    )
+    ttt_update_interval: int = field(
+        default = 8,
+        metadata={
+            "help": "maximum buffer size before update the model for test time training"
+        },
+    )
 
 
 
@@ -188,6 +315,12 @@ def train():
             cache_dir=training_args.cache_dir,
             quantization_config=quantization_config if model_args.load_in_4bit else None,
             new_config=peft_config,
+        )
+    elif training_args.mode == "online":
+        model = AutoPromptDecoder.from_pretrained(
+            training_args.online_training_model_path,
+            low_cpu_mem_usage=True,
+            torch_dtype=torch.float16,
         )
     else:
         # Set RoPE scaling factor
