@@ -116,7 +116,6 @@ class DistillationTrainer(Trainer):
             loss /= num_special_tokens
         return (loss, outputs) if return_outputs else loss
     
-    #adapted from https://github.com/LiuXiaoxuanPKU/OSD/blob/main/distill/distill_trainer.py
     def traning_step(self, model, inputs):
         self.train_step_cnt += 1
         if self.mode == "offline":
