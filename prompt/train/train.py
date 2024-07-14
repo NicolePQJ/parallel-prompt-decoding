@@ -3,6 +3,7 @@ import warnings
 import math
 import pathlib
 from typing import Dict, Optional
+import wandb
 
 import torch
 import transformers
@@ -59,21 +60,21 @@ class ParamEfficientFineTuner(Trainer):
 
 
 class DistillationTrainer(Trainer):
-    #copied from https://github.com/LiuXiaoxuanPKU/OSD/blob/main/distill/distill_trainer.py
     def __init__(self, *args, ** kwargs):
         super().__init__(*args, **kwargs)
         args = kwargs["args"]
 
         # test time training parameters
         self.mode = args.mode
+        self.eval_interval = args.ttt_eval_interval
         self.ttt_update_interval = args.ttt_update_interval
         self.buffer = []
-        # self.alphas = []
-        # self.alphas_by_dataset = {}
-        # self.alphas_by_language = {}
-        # self.alphs_by_topic = {}
-        # self.sample_steps = []
         self.training_step_1 = True
+        self.accept_length_list = []
+        self.training_step_cnt = 0
+        self.ttt_input_ids = []
+        self.ttt_logits = []
+        self.ttt_prompt_logits = []
 
     def compute_loss(self, model, inputs, return_outputs=False):
         """
@@ -117,7 +118,7 @@ class DistillationTrainer(Trainer):
         return (loss, outputs) if return_outputs else loss
     
     def traning_step(self, model, inputs):
-        self.train_step_cnt += 1
+        self.training_step_cnt += 1
         if self.mode == "offline":
             return super().training_step(model, inputs)
         elif self.mode == "online":
@@ -145,8 +146,8 @@ class DistillationTrainer(Trainer):
             outputs = model(
             input_ids=input_ids,
             )
-            logits = outputs.logits[:, -num_special_tokens-1:-num_special_tokens, :]
-            prompt_logits = outputs.logits[:, -num_special_tokens:, :]
+            self.ttt_logits = outputs.logits[:, -num_special_tokens-1:-num_special_tokens, :]
+            self.ttt_prompt_logits = outputs.logits[:, -num_special_tokens:, :]
             self.training_step_1 = False
         
         temperature = 0.0
@@ -155,14 +156,15 @@ class DistillationTrainer(Trainer):
         sampling = 'greedy'
 
         with torch.inference_mode():
+            self.model.eval()
             candidates, tree_candidates_embeds = model.generate_candidates(
-                logits, 
-                prompt_logits, 
+                self.ttt_logits, 
+                self.ttt_prompt_logits, 
                 temperature, 
                 posterior_threshold, 
                 posterior_alpha, 
                 sampling)
-            logits, all_logits = model.tree_decoding(tree_candidates_embeds, past_key_values, input_ids)
+            logits, all_logits = model.tree_decoding(tree_candidates_embeds, past_key_values, self.ttt_input_ids)
             best_candidate, accept_length = model.evaluate_posterior(
                 logits, 
                 candidates, 
@@ -179,8 +181,8 @@ class DistillationTrainer(Trainer):
                 test_prompt_logits = all_logits[:, prompt_token_indices][:,0,:]
                 #update buffer with rejected candidates and logits
                 self.buffer.append([test_logits, test_prompt_logits])
-            input_ids, logits, prompt_logits, new_token = model.update_inference_inputs(
-                    input_ids,
+            self.ttt_input_ids, self.ttt_logits, self.ttt_prompt_logits, new_token = model.update_inference_inputs(
+                    self.ttt_input_ids,
                     candidates,
                     best_candidate,
                     accept_length,
@@ -190,7 +192,13 @@ class DistillationTrainer(Trainer):
                     past_key_values_data,
                     current_length_data,
             )
-            inputs["input_ids"] = input_ids
+            #inputs["input_ids"] = input_ids
+            #yield input_ids, logits, prompt_logits, new_token
+            self.accept_length_list.append(accept_length)
+            if self.training_step_cnt%self.eval_interval==0:
+                avg_accept_length = sum(self.accept_length_list)*1.0/self.eval_interval
+                acceptance_rate = avg_accept_length/num_special_tokens
+                wandb.log({"acceptance_rate": acceptance_rate})
 
         #update model
         if len(self.buffer) >= self.ttt_update_interval:
@@ -274,6 +282,12 @@ class TrainingArguments(transformers.TrainingArguments):
         default = 8,
         metadata={
             "help": "maximum buffer size before update the model for test time training"
+        },
+    )
+    ttt_eval_interval: int = field(
+        default = 10,
+        metadata={
+            "help":"Interval at which acceptance length is ploted"
         },
     )
 
