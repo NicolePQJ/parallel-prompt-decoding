@@ -3,11 +3,11 @@ import warnings
 import math
 import pathlib
 from typing import Dict, Optional
-import wandb
 
 import torch
 import transformers
 from transformers import Trainer, BitsAndBytesConfig
+#from transformers import Trainer
 from transformers.trainer_pt_utils import LabelSmoother
 
 from torch.nn import CrossEntropyLoss
@@ -19,6 +19,36 @@ from prompt.model.modeling_llama_custom import LlamaForCausalLM as CustomLlamaFo
 from prompt.model.kv_cache import initialize_past_key_values
 
 IGNORE_TOKEN_ID = LabelSmoother.ignore_index
+
+class JSONDataset(Dataset):
+    def __init__(self, json_data, tokenizer, max_length=64):
+        self.data = json_data
+        self.tokenizer = tokenizer
+        self.max_length = max_length
+
+    def __len__(self):
+        return len(self.data)
+
+    def __getitem__(self, idx):
+        text = self.data[idx]['instruction']
+        label = self.data[idx]['output']
+        
+        # Tokenize the text
+        encoding = self.tokenizer.encode_plus(
+            text,
+            add_special_tokens=True,
+            max_length=self.max_length,
+            return_token_type_ids=False,
+            padding='max_length',
+            return_attention_mask=True,
+            return_tensors='pt',
+        )
+        
+        return {
+            'input_ids': encoding['input_ids'].flatten(),
+            'attention_mask': encoding['attention_mask'].flatten(),
+            'labels': torch.tensor(label, dtype=torch.long)
+        }
 
 class ParamEfficientFineTuner(Trainer):
     def compute_loss(self, model, inputs, return_outputs=False):
@@ -75,6 +105,7 @@ class DistillationTrainer(Trainer):
         self.ttt_input_ids = []
         self.ttt_logits = []
         self.ttt_prompt_logits = []
+        self.eval_path = args.accuracy_path
 
     def compute_loss(self, model, inputs, return_outputs=False):
         """
@@ -195,10 +226,13 @@ class DistillationTrainer(Trainer):
             #inputs["input_ids"] = input_ids
             #yield input_ids, logits, prompt_logits, new_token
             self.accept_length_list.append(accept_length)
+            log_path = os.path.join(self.eval_path)
+            os.makedirs(self.eval_path, exist_ok=True)
             if self.training_step_cnt%self.eval_interval==0:
                 avg_accept_length = sum(self.accept_length_list)*1.0/self.eval_interval
                 acceptance_rate = avg_accept_length/num_special_tokens
-                wandb.log({"acceptance_rate": acceptance_rate})
+                with open(log_path, 'a') as log_file:
+                    log_file.write(f"acceptance_rate: {acceptance_rate}\n")
 
         #update model
         if len(self.buffer) >= self.ttt_update_interval:
@@ -211,13 +245,15 @@ class DistillationTrainer(Trainer):
                     F.log_softmax(prompt_logit),
                     F.softmax(logit),
                     reduction='sum'
-                ) / prompt_logits.shape[0]
+                ) / self.ttt_prompt_logits.shape[0]
                 loss += loss_i
             loss.backward()
             self.buffer = []
+            #torch.cuda.empty_cache()
             return loss.detach()
         else:
             self.model.eval()
+            #torch.cuda.empty_cache()
             return torch.tensor(-1).cuda()
 
 
@@ -288,6 +324,12 @@ class TrainingArguments(transformers.TrainingArguments):
         default = 10,
         metadata={
             "help":"Interval at which acceptance length is ploted"
+        },
+    )
+    accuracy_path: str = field(
+        default = "./log/ttt/accuracy",
+        metadata = {
+            "help":"path to log evaluation results"
         },
     )
 
@@ -383,9 +425,18 @@ def train():
     )
     tokenizer.pad_token = tokenizer.unk_token
     
+    #device = torch.device("cuda:1" if torch.cuda.is_available() else "cpu")
+    #model = model.to(device)
+    
     # Load data
-    if data_args.use_chunked:
-        data = ChunkDataset(data_args.dataset_path)
+    # if data_args.use_chunked:
+    #     data = ChunkDataset(data_args.dataset_path)
+    if training_args.mode == "online":
+        with open(data_args.dataset_path, 'r') as f:
+            train_data = json.load(f)
+        train_data = train_data[:10]
+        data = JSONDataset(train_data, tokenizer)
+        data = DataLoader(data, batch_size=1, shuffle=True)
     else:
         data = torch.load(data_args.dataset_path)
         data.set_size(data_args.size)
@@ -411,6 +462,7 @@ def train():
     optimizer = optim_cls(optimizer_grouped_parameters, **optim_kwargs)
     
     # Start trainner
+    #print(torch.cuda.memory_summary(device=None, abbreviated=False))
     if training_args.trainer_type == "distillation_trainer":
         trainer = DistillationTrainer(
             model=model, tokenizer=tokenizer, args=training_args, train_dataset=data, eval_dataset=None, optimizers=(optimizer, None)
@@ -421,6 +473,7 @@ def train():
         )
     else: 
         raise ValueError(f"Trainer type {training_args.trainer_type} not supported.")
+    print(torch.cuda.memory_summary(device=None, abbreviated=False))
 
     if list(pathlib.Path(training_args.output_dir).glob("checkpoint-*")):
         print("Resuming training...")
@@ -429,7 +482,7 @@ def train():
         trainer.train()
 
     # Save model
-    model.save_pretrained(training_args.output_dir)
+    #model.save_pretrained(training_args.output_dir)
 
 if __name__ == "__main__":
     train()

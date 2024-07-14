@@ -91,6 +91,7 @@ def main(args):
             approximate_ids.append(approximate_tokens.detach())
             for _ in range(steps):
                 outputs= model(preds)
+                #logits = model.ppd_generate(input_ids, max_steps = 1)
                 logits = outputs.logits
                 pred = torch.argmax(logits[:, -num_special_tokens-1, :], dim=-1)
                 prompt_logits = logits[:, -num_special_tokens:, :].contiguous()

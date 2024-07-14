@@ -65,6 +65,7 @@ class PromptDecoder(PeftModel):
             adapter_name (str, optional): The name of the adapter to be used. Defaults to 'default'. 
         """
         super().__init__(model, peft_config)
+        self.device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
         self.tokenizer = transformers.AutoTokenizer.from_pretrained(peft_config.base_model_name_or_path)
         self.base_model.model.prompt_token_indices = [-i for i in range(peft_config.num_virtual_tokens, 0, -1)]
         if peft_config.vt_attention_type == VTAttentionType.DECODER:

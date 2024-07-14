@@ -1,6 +1,6 @@
 #! /bin/bash
 accelerate launch --num_processes 4 prompt/train/train.py --model_name_or_path lmsys/vicuna-7b-v1.3 \
-    --dataset_path "./ShareGPT_training_dataset_2_distillation.pt" \
+    --dataset_path "./data/alpaca_eval.json" \
     --output_dir test/ \
     --num_train_epochs 1 \
     --save_steps 500 \
