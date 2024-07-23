@@ -9,6 +9,7 @@ import transformers
 from transformers import Trainer, BitsAndBytesConfig
 #from transformers import Trainer
 from transformers.trainer_pt_utils import LabelSmoother
+from transformers.tokenization_utils_base import BatchEncoding
 
 from torch.nn import CrossEntropyLoss
 import torch.nn.functional as F
@@ -17,38 +18,70 @@ from prompt.utils import *
 from prompt.model.model import PromptDecoder, PromptConfig, AutoPromptDecoder
 from prompt.model.modeling_llama_custom import LlamaForCausalLM as CustomLlamaForCausalLM
 from prompt.model.kv_cache import initialize_past_key_values
+from torch.utils.data import Dataset
+import sys
 
 IGNORE_TOKEN_ID = LabelSmoother.ignore_index
 
-class JSONDataset(Dataset):
-    def __init__(self, json_data, tokenizer, max_length=64):
-        self.data = json_data
-        self.tokenizer = tokenizer
-        self.max_length = max_length
+sys.stderr = open('error_log.txt', 'w')
+sys.stdout = open('output.txt', 'w')
 
+class JSONDataset(Dataset):
+    def __init__(self,tensor_data):
+        self.data = tensor_data
     def __len__(self):
         return len(self.data)
-
     def __getitem__(self, idx):
-        text = self.data[idx]['instruction']
-        label = self.data[idx]['output']
+        return self.data[idx]
+
+def JsonDataset(dataset, tokenizer):
+    tokenized_data = []
+    for item in dataset:
+        input_text = item['instruction']
+        output_text = item['output']
         
-        # Tokenize the text
-        encoding = self.tokenizer.encode_plus(
-            text,
+        input_encoding = tokenizer.encode_plus(
+            input_text,
             add_special_tokens=True,
-            max_length=self.max_length,
+            max_length=128,
             return_token_type_ids=False,
             padding='max_length',
+            truncation = True,
             return_attention_mask=True,
-            return_tensors='pt',
+            return_tensors='pt'
         )
         
-        return {
-            'input_ids': encoding['input_ids'].flatten(),
-            'attention_mask': encoding['attention_mask'].flatten(),
-            'labels': torch.tensor(label, dtype=torch.long)
-        }
+        output_encoding = tokenizer.encode_plus(
+            output_text,
+            add_special_tokens=True,
+            max_length=128,
+            return_token_type_ids=False,
+            padding='max_length',
+            truncation=True,
+            return_attention_mask=True,
+            return_tensors='pt'
+        )
+        
+        tokenized_data.append({
+            'input_ids': torch.tensor(input_encoding.input_ids),
+            'attention_mask': torch.tensor(input_encoding.attention_mask),
+            'labels': torch.tensor(output_encoding.input_ids),
+            'output_attention_mask': torch.tensor(output_encoding.attention_mask)
+        })
+        #print(input_encoding.input_ids)
+    # inputs_tensor = torch.stack([item['input_ids'] for item in tokenized_data])
+    # input_masks_tensor = torch.stack([item['attention_mask'] for item in tokenized_data])
+    # outputs_tensor = torch.stack([item['labels'] for item in tokenized_data])
+    # output_masks_tensor = torch.stack([item['output_attention_mask'] for item in tokenized_data])
+    
+    # tensor_data = {
+    #     'input_id': inputs_tensor,
+    #     'attention_mask': input_masks_tensor,
+    #     'labels': outputs_tensor,
+    #     'output_masks': output_masks_tensor
+    # }
+    #print(tokenized_data)
+    return tokenized_data
 
 class ParamEfficientFineTuner(Trainer):
     def compute_loss(self, model, inputs, return_outputs=False):
@@ -102,12 +135,35 @@ class DistillationTrainer(Trainer):
         self.training_step_1 = True
         self.accept_length_list = []
         self.training_step_cnt = 0
-        self.ttt_input_ids = []
-        self.ttt_logits = []
-        self.ttt_prompt_logits = []
+        self.ttt_input_ids = torch.tensor([])
+        self.ttt_logits = torch.tensor([])
+        self.ttt_prompt_logits = torch.tensor([])
         self.eval_path = args.accuracy_path
-
+        self.new_token = 0
+        print("mode:", self.mode)
+    
     def compute_loss(self, model, inputs, return_outputs=False):
+        """
+        Compute the training loss for the model.
+
+        Args:
+            model (torch.nn.Module): The model for which to compute the loss.
+            inputs (dict): The input data, including input IDs, attention mask, and labels.
+            return_outputs (bool): Whether to return model outputs along with the loss.
+
+        Returns:
+            Union[float, Tuple[float, torch.Tensor]]: The computed loss, optionally with model outputs.
+        """
+        #self.training_step_cnt += 1
+        if self.mode == "offline":
+            print("training_step: offline")
+            return self.ppd_compute_loss(model, inputs, return_outputs)
+        elif self.mode == "online":
+            return self.ttt_compute_loss(model, inputs, return_outputs)
+        else:
+            raise ValueError()
+
+    def ppd_compute_loss(self, model, inputs, return_outputs=False):
         """
         Compute the training loss for the model.
 
@@ -148,38 +204,56 @@ class DistillationTrainer(Trainer):
             loss /= num_special_tokens
         return (loss, outputs) if return_outputs else loss
     
-    def traning_step(self, model, inputs):
-        self.training_step_cnt += 1
-        if self.mode == "offline":
-            return super().training_step(model, inputs)
-        elif self.mode == "online":
-            return self.ttt_training_step(model, inputs)
-        else:
-            raise ValueError()
-    
-    def ttt_training_step(self, model, inputs):
+    def ttt_compute_loss(self, model, inputs, return_outputs=False):
         max_new_tokens = 128
-        batch_size = inputs["inputs_ids"].shape[0]
+        batch_size = inputs["input_ids"].shape[0]
         assert(
             batch_size == 1
         )
         num_special_tokens = self.model.active_peft_config.num_special_tokens
 
         #remove masking
-        input_ids = inputs["input_ids"][inputs["attention_mask"]].unsqueeze(0)
+        input_ids = inputs["input_ids"]
+        input_ids = torch.squeeze(input_ids, dim=1)
+        print("input_ids_shape_train:", input_ids.shape)
+        #[inputs["attention_mask"]].unsqueeze(0)
+        
+        with torch.inference_mode():
+            if not hasattr(self, "inference_buffers"):
+                print('Generate buffers')
+                model.generate_dynamic_buffers(get_dynamic_sparse_tree(model.active_peft_config.base_model_name_or_path))
+            # Initialize the past key and value states
+            if hasattr(self, "past_key_values"):
+                past_key_values = model.past_key_values
+                past_key_values_data = model.past_key_values_data
+                current_length_data = model.current_length_data
+                # Reset the past key and value states
+                current_length_data.zero_()
+            else:
+                print('Initialize past key values')
+                (
+                    past_key_values,
+                    past_key_values_data,
+                    current_length_data,
+                ) = initialize_past_key_values(model.base_model)
+                model.past_key_values = past_key_values
+                print("past_key_values:", len(past_key_values))
+                model.past_key_values_data = past_key_values_data
+                model.current_length_data = current_length_data
+            self.ttt_logits, self.ttt_prompt_logits = model.start_inference(input_ids, past_key_values, current_length_data)
+            new_token = 0
+            accept_lengths = []
+            self.ttt_input_ids = input_ids
         
         #use ppd to generate tokens
-        if self.training_step_1:
-            (past_key_values,
-                past_key_values_data,
-                current_length_data,
-            ) = initialize_past_key_values(model.base_model)
-            outputs = model(
-            input_ids=input_ids,
-            )
-            self.ttt_logits = outputs.logits[:, -num_special_tokens-1:-num_special_tokens, :]
-            self.ttt_prompt_logits = outputs.logits[:, -num_special_tokens:, :]
-            self.training_step_1 = False
+        # if self.training_step_1:
+        #     outputs = model(
+        #     input_ids=input_ids,
+        #     )
+        #     self.ttt_logits = outputs.logits[:, -num_special_tokens-1:-num_special_tokens, :]
+        #     self.ttt_prompt_logits = outputs.logits[:, -num_special_tokens:, :]
+        #     self.training_step_1 = False
+        #     self.ttt_input_ids = input_ids
         
         temperature = 0.0
         posterior_threshold = 0.09
@@ -187,52 +261,60 @@ class DistillationTrainer(Trainer):
         sampling = 'greedy'
 
         with torch.inference_mode():
-            self.model.eval()
-            candidates, tree_candidates_embeds = model.generate_candidates(
-                self.ttt_logits, 
-                self.ttt_prompt_logits, 
-                temperature, 
-                posterior_threshold, 
-                posterior_alpha, 
-                sampling)
-            logits, all_logits = model.tree_decoding(tree_candidates_embeds, past_key_values, self.ttt_input_ids)
-            best_candidate, accept_length = model.evaluate_posterior(
-                logits, 
-                candidates, 
-                temperature, 
-                posterior_threshold, 
-                posterior_alpha,
-                sampling)
-            #get first rejected logits from best candidates
-            if accept_length != logits.size(-1):
-                test_logits = logits[None, best_candidate, accept_length+1 : accept_length + 2]
-                #get first regjected prompt logits
-                candidate_index = model.inference_buffers['retrieve_indices'][best_candidate, accept_length : accept_length + 1]
-                prompt_token_indices = model.inference_buffers['special_token_indices'][candidate_index.cpu().item()]
-                test_prompt_logits = all_logits[:, prompt_token_indices][:,0,:]
-                #update buffer with rejected candidates and logits
-                self.buffer.append([test_logits, test_prompt_logits])
-            self.ttt_input_ids, self.ttt_logits, self.ttt_prompt_logits, new_token = model.update_inference_inputs(
-                    self.ttt_input_ids,
-                    candidates,
-                    best_candidate,
-                    accept_length,
-                    logits,
-                    all_logits,
-                    new_token,
-                    past_key_values_data,
-                    current_length_data,
-            )
-            #inputs["input_ids"] = input_ids
-            #yield input_ids, logits, prompt_logits, new_token
-            self.accept_length_list.append(accept_length)
-            log_path = os.path.join(self.eval_path)
-            os.makedirs(self.eval_path, exist_ok=True)
-            if self.training_step_cnt%self.eval_interval==0:
-                avg_accept_length = sum(self.accept_length_list)*1.0/self.eval_interval
-                acceptance_rate = avg_accept_length/num_special_tokens
-                with open(log_path, 'a') as log_file:
-                    log_file.write(f"acceptance_rate: {acceptance_rate}\n")
+            for _ in range(64):
+                self.training_step_cnt += 1
+                self.model.eval()
+                candidates, tree_candidates_embeds = model.generate_candidates(
+                    self.ttt_logits, 
+                    self.ttt_prompt_logits, 
+                    temperature, 
+                    posterior_threshold, 
+                    posterior_alpha, 
+                    sampling)
+                print("ttt_input_ids:", self.ttt_input_ids.shape)
+                print("past_key_values_1:", len(past_key_values))
+                logits, all_logits = model.tree_decoding(tree_candidates_embeds, past_key_values, self.ttt_input_ids)
+                best_candidate, accept_length = model.evaluate_posterior(
+                    logits, 
+                    candidates, 
+                    temperature, 
+                    posterior_threshold, 
+                    posterior_alpha,
+                    sampling)
+                #get first rejected logits from best candidates
+                if accept_length != logits.size(-1):
+                    test_logits = logits[None, best_candidate, accept_length+1 : accept_length + 2]
+                    #get first regjected prompt logits
+                    candidate_index = model.inference_buffers['retrieve_indices'][best_candidate, accept_length : accept_length + 1]
+                    prompt_token_indices = model.inference_buffers['special_token_indices'][candidate_index.cpu().item()]
+                    test_prompt_logits = all_logits[:, prompt_token_indices][:,0,:]
+                    #update buffer with rejected candidates and logits
+                    self.buffer.append([test_logits, test_prompt_logits])
+                self.ttt_input_ids, self.ttt_logits, self.ttt_prompt_logits, self.new_token = model.update_inference_inputs(
+                        self.ttt_input_ids,
+                        candidates,
+                        best_candidate,
+                        accept_length,
+                        logits,
+                        all_logits,
+                        self.new_token,
+                        past_key_values_data,
+                        current_length_data,
+                )
+                #inputs["input_ids"] = input_ids
+                #yield input_ids, logits, prompt_logits, new_token
+                #self.accept_length_list.append(accept_length)
+                #cumulative
+                self.accept_length_list.append(accept_length/num_special_tokens)
+                log_path = os.path.join(self.eval_path)
+                os.makedirs(self.eval_path, exist_ok=True)
+                if self.training_step_cnt%self.eval_interval==0:
+                    #avg_accept_length = sum(self.accept_length_list)*1.0/self.eval_interval
+                    #acceptance_rate = avg_accept_length/num_special_tokens
+                    #self.accept_length_list = []
+                    avg_accept_length = sum(self.accept_length_list)*1.0/len(self.accept_length_list)
+                    with open("log/ttt/accuracy/accuracy.txt", 'a') as log_file:
+                        log_file.write(f"acceptance_rate: {avg_accept_length}\n")
 
         #update model
         if len(self.buffer) >= self.ttt_update_interval:
@@ -247,13 +329,13 @@ class DistillationTrainer(Trainer):
                     reduction='sum'
                 ) / self.ttt_prompt_logits.shape[0]
                 loss += loss_i
-            loss.backward()
+            #loss.backward()
             self.buffer = []
-            #torch.cuda.empty_cache()
-            return loss.detach()
+            #return loss.detach()
+            loss.requires_grad = True
+            return (loss, outputs) if return_outputs else loss
         else:
             self.model.eval()
-            #torch.cuda.empty_cache()
             return torch.tensor(-1).cuda()
 
 
@@ -327,7 +409,7 @@ class TrainingArguments(transformers.TrainingArguments):
         },
     )
     accuracy_path: str = field(
-        default = "./log/ttt/accuracy",
+        default = "./log/ttt",
         metadata = {
             "help":"path to log evaluation results"
         },
@@ -431,12 +513,23 @@ def train():
     # Load data
     # if data_args.use_chunked:
     #     data = ChunkDataset(data_args.dataset_path)
+    #print(torch.cuda.memory_summary(device=None, abbreviated=False))
     if training_args.mode == "online":
-        with open(data_args.dataset_path, 'r') as f:
-            train_data = json.load(f)
-        train_data = train_data[:10]
-        data = JSONDataset(train_data, tokenizer)
-        data = DataLoader(data, batch_size=1, shuffle=True)
+        train_data = json.load(open(data_args.dataset_path, "r"))
+        #train_data = train_data[:10]
+        data = JsonDataset(train_data, tokenizer)
+        data = JSONDataset(data)
+        #data.set_size(data_args.size)
+        #print("dataset:"data.shape())
+        #data = DataLoader(data, batch_size=1, shuffle=True)
+        # inputs_id = [item['instruction'] for item in train_data]
+        # labels = [item['output'] for item in train_data]
+        # inputs_tensor = torch.tensor(inputs_id)
+        # outputs_tensor = torch.tensor(labels)
+        # data = {
+        #     'inputs_id': inputs_tensor,
+        #     'labels': outputs_tensor
+        # }
     else:
         data = torch.load(data_args.dataset_path)
         data.set_size(data_args.size)
@@ -482,7 +575,7 @@ def train():
         trainer.train()
 
     # Save model
-    #model.save_pretrained(training_args.output_dir)
+    model.save_pretrained(training_args.output_dir)
 
 if __name__ == "__main__":
     train()
