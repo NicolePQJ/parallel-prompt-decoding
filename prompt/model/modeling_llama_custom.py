@@ -646,6 +646,62 @@ class LlamaDecoderLayer(nn.Module):
 
         return outputs
 
+#Nsth layer
+class InsertStreamLayer(nn.Module):
+    def __init__(self, config: LlamaConfig, num_post_tokens, embed_dimension):
+        super().__init__()
+        self.hidden_size = config.hidden_size
+        self.self_attn = (
+            LlamaAttention(config=config)
+            if not getattr(config, "_flash_attn_2_enabled", False)
+            else LlamaFlashAttention2(config=config)
+        )
+        self.mlp = LlamaMLP(config)
+        self.input_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        
+        self.stream_embedding = nn.Embedding(num_post_tokens, embed_dimension)
+        self.num_post_tokens = num_post_tokens
+        
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_value = None, # [MODIFIED] Use custom past_key_value
+        output_attentions: Optional[bool] = False,
+        use_cache: Optional[bool] = False,
+        padding_mask: Optional[torch.LongTensor] = None,
+    ) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
+        for i in range(self.num_post_tokens):
+            stream_embeds[i] = self.stream_embedding(torch.tensor([i]))
+        
+class PostInsertionLayer(nn.Module):
+    def __init__(self, config: LlamaConfig):
+        super().__init__()
+        self.hidden_size = config.hidden_size
+        self.self_attn = (
+            LlamaAttention(config=config)
+            if not getattr(config, "_flash_attn_2_enabled", False)
+            else LlamaFlashAttention2(config=config)
+        )
+        self.mlp = LlamaMLP(config)
+        self.input_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        
+        #self.stream_embedding = nn.Embedding(num_post_tokens, embed_dimension)
+    
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_value = None, # [MODIFIED] Use custom past_key_value
+        output_attentions: Optional[bool] = False,
+        use_cache: Optional[bool] = False,
+        padding_mask: Optional[torch.LongTensor] = None,
+    ) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
+        
 
 LLAMA_START_DOCSTRING = r"""
     This model inherits from [`PreTrainedModel`]. Check the superclass documentation for the generic methods the
@@ -1267,3 +1323,20 @@ class LlamaForSequenceClassification(LlamaPreTrainedModel):
             hidden_states=transformer_outputs.hidden_states,
             attentions=transformer_outputs.attentions,
         )
+
+class LlamaWithMultistreams(LlamaPreTrainedModel):
+    def __init__(self, config: LlamaConfig):
+        super().__init__(config)
+        self.padding_idx = config.pad_token_id
+        self.vocab_size = config.vocab_size
+
+        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
+        self.layers = nn.ModuleList([LlamaDecoderLayer(config) for _ in range(config.num_hidden_layers-config.num_post_tokens)])
+        self.layers.append(InsertStreamLayer(config, config.num_post_tokens,config.embed_dimension))
+        for _ in range(config.num_post_tokens):
+            self.layers.append(PostInsertionLayer(config))
+        self.norm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+
+        self.gradient_checkpointing = False
+        # Initialize weights and apply final processing
+        self.post_init()
