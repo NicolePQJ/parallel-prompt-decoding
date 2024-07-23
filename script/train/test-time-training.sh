@@ -6,7 +6,7 @@ accelerate launch --num_processes 1 prompt/train/train.py --model_name_or_path l
     --num_train_epochs 1 \
     --save_steps 500 \
     --model_max_length 1024 \
-    --num_special_tokens 1 \
+    --num_special_tokens 3 \
     --virtual_tokens_per_special_token 1 \
     --per_device_train_batch_size 1 \
     --per_device_eval_batch_size 1 \

@@ -194,8 +194,6 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids):
     # The first two dimensions of cos and sin are always 1, so we can `squeeze` them.
     cos = cos.squeeze(1).squeeze(0)  # [seq_len, dim]
     sin = sin.squeeze(1).squeeze(0)  # [seq_len, dim]
-    #print("cos_shape:", cos.shape)
-    print("position_ids_shape_199:", position_ids)
     cos = cos[position_ids].unsqueeze(1)  # [bs, 1, seq_len, dim]
     sin = sin[position_ids].unsqueeze(1)  # [bs, 1, seq_len, dim]
     q_embed = (q * cos) + (rotate_half(q) * sin)
@@ -343,17 +341,9 @@ class LlamaAttention(nn.Module):
         value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
 
         kv_seq_len = key_states.shape[-2]
-        # print("k_states_shape:", key_states.shape)
-        # print("bsz:", bsz)
-        # print("head_dim:", self.head_dim)
-        # print("num_key_value_heads:",self.num_key_value_heads )
-        # print("q_len:", q_len)
-        # print("kv_seq_len:", kv_seq_len)
         if past_key_value is not None:
             kv_seq_len += past_key_value[0].shape[-2]
-        print("kv_seq_len_1:", kv_seq_len)
         cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
-        print("position_ids_356:", position_ids.shape)
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
 
         # [MODIFIED] Using KVCache mechanism for preallocated GPU memory optimization
@@ -628,7 +618,6 @@ class LlamaDecoderLayer(nn.Module):
         residual = hidden_states
 
         hidden_states = self.input_layernorm(hidden_states)
-        print("position_ids_632:", position_ids.shape)
         # Self Attention
         hidden_states, self_attn_weights, present_key_value = self.self_attn(
             hidden_states=hidden_states,
@@ -640,7 +629,6 @@ class LlamaDecoderLayer(nn.Module):
             padding_mask=padding_mask,
         )
         hidden_states = residual + hidden_states
-        print("hidden_states_632:", hidden_states.shape)
 
         # Fully Connected
         residual = hidden_states
@@ -893,9 +881,6 @@ class LlamaModel(LlamaPreTrainedModel):
         seq_length_with_past = seq_length
         past_key_values_length = 0
     
-        print("inputs_embeds_910:", inputs_embeds.shape)
-        #print("input_ids_910:", input_ids.shape)
-
         if past_key_values is not None:
             past_key_values_length = past_key_values[0][0].shape[2]
             seq_length_with_past = seq_length_with_past + past_key_values_length
@@ -931,7 +916,6 @@ class LlamaModel(LlamaPreTrainedModel):
         self.position_ids = position_ids
 
         hidden_states = inputs_embeds
-        print("hidden_states_930:", hidden_states.shape)
 
         if self.gradient_checkpointing and self.training:
             if use_cache:
@@ -964,7 +948,6 @@ class LlamaModel(LlamaPreTrainedModel):
                     create_custom_forward(decoder_layer), hidden_states, attention_mask, position_ids
                 )
             else:
-                print("position_ids_966:", position_ids.shape)
                 layer_outputs = decoder_layer(
                     hidden_states,
                     attention_mask=attention_mask,
@@ -1077,7 +1060,6 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
         )
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
         
-        print("position_ids_1079:", position_ids)
         # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
         outputs = self.model(
             input_ids=input_ids,

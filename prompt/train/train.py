@@ -68,19 +68,6 @@ def JsonDataset(dataset, tokenizer):
             'labels': torch.tensor(output_encoding.input_ids),
             'output_attention_mask': torch.tensor(output_encoding.attention_mask)
         })
-        #print(input_encoding.input_ids)
-    # inputs_tensor = torch.stack([item['input_ids'] for item in tokenized_data])
-    # input_masks_tensor = torch.stack([item['attention_mask'] for item in tokenized_data])
-    # outputs_tensor = torch.stack([item['labels'] for item in tokenized_data])
-    # output_masks_tensor = torch.stack([item['output_attention_mask'] for item in tokenized_data])
-    
-    # tensor_data = {
-    #     'input_id': inputs_tensor,
-    #     'attention_mask': input_masks_tensor,
-    #     'labels': outputs_tensor,
-    #     'output_masks': output_masks_tensor
-    # }
-    #print(tokenized_data)
     return tokenized_data
 
 class ParamEfficientFineTuner(Trainer):
@@ -140,7 +127,7 @@ class DistillationTrainer(Trainer):
         self.ttt_prompt_logits = torch.tensor([])
         self.eval_path = args.accuracy_path
         self.new_token = 0
-        print("mode:", self.mode)
+        #print("mode:", self.mode)
     
     def compute_loss(self, model, inputs, return_outputs=False):
         """
@@ -156,7 +143,6 @@ class DistillationTrainer(Trainer):
         """
         #self.training_step_cnt += 1
         if self.mode == "offline":
-            print("training_step: offline")
             return self.ppd_compute_loss(model, inputs, return_outputs)
         elif self.mode == "online":
             return self.ttt_compute_loss(model, inputs, return_outputs)
@@ -215,7 +201,6 @@ class DistillationTrainer(Trainer):
         #remove masking
         input_ids = inputs["input_ids"]
         input_ids = torch.squeeze(input_ids, dim=1)
-        print("input_ids_shape_train:", input_ids.shape)
         #[inputs["attention_mask"]].unsqueeze(0)
         
         with torch.inference_mode():
@@ -230,14 +215,12 @@ class DistillationTrainer(Trainer):
                 # Reset the past key and value states
                 current_length_data.zero_()
             else:
-                print('Initialize past key values')
                 (
                     past_key_values,
                     past_key_values_data,
                     current_length_data,
                 ) = initialize_past_key_values(model.base_model)
                 model.past_key_values = past_key_values
-                print("past_key_values:", len(past_key_values))
                 model.past_key_values_data = past_key_values_data
                 model.current_length_data = current_length_data
             self.ttt_logits, self.ttt_prompt_logits = model.start_inference(input_ids, past_key_values, current_length_data)
@@ -271,8 +254,6 @@ class DistillationTrainer(Trainer):
                     posterior_threshold, 
                     posterior_alpha, 
                     sampling)
-                print("ttt_input_ids:", self.ttt_input_ids.shape)
-                print("past_key_values_1:", len(past_key_values))
                 logits, all_logits = model.tree_decoding(tree_candidates_embeds, past_key_values, self.ttt_input_ids)
                 best_candidate, accept_length = model.evaluate_posterior(
                     logits, 
@@ -519,17 +500,6 @@ def train():
         #train_data = train_data[:10]
         data = JsonDataset(train_data, tokenizer)
         data = JSONDataset(data)
-        #data.set_size(data_args.size)
-        #print("dataset:"data.shape())
-        #data = DataLoader(data, batch_size=1, shuffle=True)
-        # inputs_id = [item['instruction'] for item in train_data]
-        # labels = [item['output'] for item in train_data]
-        # inputs_tensor = torch.tensor(inputs_id)
-        # outputs_tensor = torch.tensor(labels)
-        # data = {
-        #     'inputs_id': inputs_tensor,
-        #     'labels': outputs_tensor
-        # }
     else:
         data = torch.load(data_args.dataset_path)
         data.set_size(data_args.size)
@@ -555,7 +525,6 @@ def train():
     optimizer = optim_cls(optimizer_grouped_parameters, **optim_kwargs)
     
     # Start trainner
-    #print(torch.cuda.memory_summary(device=None, abbreviated=False))
     if training_args.trainer_type == "distillation_trainer":
         trainer = DistillationTrainer(
             model=model, tokenizer=tokenizer, args=training_args, train_dataset=data, eval_dataset=None, optimizers=(optimizer, None)
@@ -566,7 +535,7 @@ def train():
         )
     else: 
         raise ValueError(f"Trainer type {training_args.trainer_type} not supported.")
-    print(torch.cuda.memory_summary(device=None, abbreviated=False))
+    #print(torch.cuda.memory_summary(device=None, abbreviated=False))
 
     if list(pathlib.Path(training_args.output_dir).glob("checkpoint-*")):
         print("Resuming training...")
