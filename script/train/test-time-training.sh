@@ -1,5 +1,5 @@
 #! /bin/bash
-export CUDA_VISIBLE_DEVICES=0
+export CUDA_VISIBLE_DEVICES=2
 accelerate launch --num_processes 1 prompt/train/train.py --model_name_or_path lmsys/vicuna-7b-v1.3 \
     --dataset_path "./data/alpaca_eval.json" \
     --output_dir test/ \

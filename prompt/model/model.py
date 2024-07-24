@@ -217,6 +217,7 @@ class PromptDecoder(PeftModel):
 
         prompts = self.get_prompt(batch_size=batch_size, task_ids=task_ids)
         prompts = prompts.to(inputs_embeds.dtype)
+        print("prompts", prompts.shape)
         # append prompts to inputs_embeds
         inputs_embeds = torch.cat((inputs_embeds, prompts), dim=1)
         outputs = self.base_model.model(inputs_embeds=inputs_embeds, **kwargs)

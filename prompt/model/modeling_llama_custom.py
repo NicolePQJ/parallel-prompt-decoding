@@ -183,6 +183,59 @@ class LlamaDynamicNTKScalingRotaryEmbedding(LlamaRotaryEmbedding):
         self.register_buffer("sin_cached", emb.sin()[None, None, :, :].to(dtype), persistent=False)
 
 
+class IdentifierEmbedding(nn.Module):
+    def __init__(self, num_identifiers, embed_dim):
+        super().__init__()
+        self.identifier_embedding = nn.Embedding(num_identifiers, embed_dim)
+        self.num_identifiers = num_identifiers
+    
+    def forward(self):
+        return self.identifier_embedding
+
+
+class RelativePositionalEmbedding(nn.Module):
+    def __init__(self, embed_dim, max_relative_positions):
+        super().__init__()
+        self.embed_dim = embed_dim
+        self.max_relative_positions = max_relative_positions
+        self.embeddings_table = nn.Embedding(2 * max_relative_positions + 1, embed_dim)
+
+    def forward(self):
+        # Create a matrix of relative positions
+        range_vec = torch.arange(self.max_relative_positions)
+        range_mat = range_vec.unsqueeze(-1) - range_vec.unsqueeze(0)
+        range_mat = range_mat[-self.max_relative_positions:,:]
+        #range_mat_clipped = torch.clamp(range_mat, -self.max_relative_positions, self.max_relative_positions)
+        #range_mat_clipped = range_mat_clipped + self.max_relative_positions  # Shift values to be positive
+        return self.embeddings_table(range_mat)
+
+
+class CombinedEmbedding(nn.Module):
+    def __init__(self, embed_dim, num_post_tokens):
+        super().__init__()
+        self.identifier_embed = IdentifierEmbedding(num_post_tokens, embed_dim)
+        self.position_embed = RelativePositionalEmbedding(embed_dim, num_post_tokens)
+        
+    def forward(self):
+        embed = self.identifier_embed + self.position_embed
+        return embed
+
+
+class LinearTransform(nn.Module):
+    def __init__(self, hidden_states):
+        super(LinearTransform, self).__init__()
+        self.linear = nn.Linear(hidden_states.size(1), 1)
+        self.hidden_states = hidden_states
+    
+    def forward(self):
+        self.hidden_states = self.hidden_states.permute(0, 2, 1)  # [batch_size, embed_dim, seq_length]
+        # Apply the linear transformation
+        x = self.linear(self.hidden_states)  # [batch_size, embed_dim, 1]
+        # Permute back to the original shape
+        self.hidden_states = x.permute(0, 2, 1)  # [batch_size, 1, embed_dim]
+        return self.hidden_states
+
+
 def rotate_half(x):
     """Rotates half the hidden dims of the input."""
     x1 = x[..., : x.shape[-1] // 2]
@@ -660,7 +713,7 @@ class InsertStreamLayer(nn.Module):
         self.input_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         
-        self.stream_embedding = nn.Embedding(num_post_tokens, embed_dimension)
+        self.stream_embedding = CombinedEmbedding(embed_dimension, num_post_tokens)
         self.num_post_tokens = num_post_tokens
         
     def forward(
@@ -673,8 +726,19 @@ class InsertStreamLayer(nn.Module):
         use_cache: Optional[bool] = False,
         padding_mask: Optional[torch.LongTensor] = None,
     ) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
+        #initialize position embedding for speculative streams
+        #do this in model function
+        #new_len = position_ids.size(1)+self.num_post_tokens
+        #position_ids = torch.arange(new_len).unsqueeze(0)
+        linear_states = LinearTransform(hidden_states)
+        stream_embeds = self.stream_embedding.sum(dim=1).unsqueeze(0)
         for i in range(self.num_post_tokens):
-            stream_embeds[i] = self.stream_embedding(torch.tensor([i]))
+            stream_embeds_i = stream_embeds[:,i,:]
+            stream_states = linear_states + stream_embeds_i
+            hidden_states = torch.cat((hidden_states, stream_states), dim=1)
+            
+        outputs = (hidden_states,)
+        return outputs
         
 class PostInsertionLayer(nn.Module):
     def __init__(self, config: LlamaConfig):
@@ -701,6 +765,7 @@ class PostInsertionLayer(nn.Module):
         use_cache: Optional[bool] = False,
         padding_mask: Optional[torch.LongTensor] = None,
     ) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
+        print("TO-DO")
         
 
 LLAMA_START_DOCSTRING = r"""
