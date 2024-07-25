@@ -395,6 +395,12 @@ class TrainingArguments(transformers.TrainingArguments):
             "help":"path to log evaluation results"
         },
     )
+    num_post_tokens: int = field(
+        default = 3,
+        metadata={
+            "help":"Number of prompt tokens inserted into hidden layers"
+        },
+    )
 
 
 
@@ -466,6 +472,7 @@ def train():
                 quantization_config=quantization_config if model_args.load_in_4bit else None,
                 # load_in_4bit=model_args.load_in_4bit,
                 # load_in_8bit=model_args.load_in_8bit,
+                num_post_tokens = training_args.num_post_tokens
             )
         else:
             raise ValueError("Only support llama for now")
